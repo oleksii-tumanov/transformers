@@ -30,6 +30,7 @@ from transformers import (
     ContinuousBatchingConfig,
     GenerationConfig,
     GenerationMixin,
+    PretrainedConfig,
     StaticCache,
 )
 from transformers.generation.continuous_batching.cache import (
@@ -43,6 +44,7 @@ from transformers.generation.continuous_batching.continuous_api import Continuou
 from transformers.generation.continuous_batching.input_outputs import build_attention_mask
 from transformers.generation.continuous_batching.requests import GenerationOutput, RequestStatus
 from transformers.testing_utils import (
+    CaptureLogger,
     require_deterministic_for_xpu,
     require_flash_attn,
     require_flash_attn_3,
@@ -56,6 +58,7 @@ from transformers.utils import (
     is_flash_attn_2_available,
     is_kernels_available,
     is_torch_xpu_available,
+    logging,
 )
 from transformers.utils.generic import is_flash_attention_requested
 
@@ -199,6 +202,31 @@ def regular_generate(
     else:
         per_prompt_logprobs = []
     return all_generated_tokens, per_prompt_logprobs
+
+
+class DummyContinuousBatchingGenerateModel(GenerationMixin):
+    def __init__(self) -> None:
+        self.config = PretrainedConfig()
+        self.generation_config = GenerationConfig()
+        self.device = torch.device("cpu")
+        self.last_generation_config = None
+
+    def generate_batch(self, inputs: list[list[int]], generation_config: GenerationConfig | None = None, **kwargs):
+        self.last_generation_config = generation_config
+        num_return_sequences = generation_config.num_return_sequences if generation_config is not None else None
+        num_return_sequences = num_return_sequences if num_return_sequences is not None else 1
+
+        outputs = {}
+        for input_idx, prompt_ids in enumerate(inputs):
+            for return_idx in range(num_return_sequences):
+                request_idx = input_idx * num_return_sequences + return_idx
+                outputs[f"req_{request_idx}"] = GenerationOutput(
+                    request_id=f"req_{request_idx}",
+                    prompt_ids=prompt_ids,
+                    generated_tokens=[10 + return_idx],
+                    status=RequestStatus.FINISHED,
+                )
+        return outputs
 
 
 # Class for all continuous batching tests that do not require any accelerator. Usualy those test are faster to run.
@@ -484,6 +512,26 @@ class ContinuousBatchingNoAcceleratorTest(unittest.TestCase):
 
         loop.call_soon_threadsafe.assert_called_once()
         self.assertTrue(router.output_queue.empty())
+
+    def test_generate_num_return_sequences_without_stale_warning(self) -> None:
+        model = DummyContinuousBatchingGenerateModel()
+        logger = logging.get_logger("transformers.generation.utils")
+
+        with CaptureLogger(logger) as captured_logs:
+            outputs = model.generate(
+                inputs=torch.tensor([[1, 2, 3]]),
+                cache_implementation="paged",
+                do_sample=True,
+                num_return_sequences=2,
+            )
+
+        self.assertEqual(model.last_generation_config.num_return_sequences, 2)
+        self.assertEqual(outputs.shape, (1, 2, 4))
+        self.assertIn("Detected cache_implementation=paged: switching to continuous batching.", captured_logs.out)
+        self.assertNotIn(
+            "num_return_sequences and num_beams are not supported for continuous batching yet.", captured_logs.out
+        )
+        self.assertNotIn("num_beams is not supported for continuous batching yet.", captured_logs.out)
 
 
 @require_torch_accelerator
